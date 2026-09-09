@@ -8,6 +8,21 @@ on the composability of Python classes. It extends the notion of
 Django's module based settings loading with well established
 object oriented programming patterns.
 
+A configuration is a pydantic model, so a setting can be declared with a type
+annotation and is validated on startup. Annotate it with ``Env`` and it is
+read from the process environment and deserialized into that type:
+
+.. code-block:: python
+
+    from configurations import Configuration, Env
+    from configurations.types import Databases, Secret
+
+    class Prod(Configuration):
+        DEBUG: Env[bool] = False
+        SECRET_KEY: Env[Secret]
+        ALLOWED_HOSTS: Env[list[str]] = ["localhost"]
+        DATABASES: Env[Databases] = Env(name="DATABASE_URL", prefix=None)
+
 Check out the `documentation`_ for more complete examples.
 
 .. |latest-version| image:: https://img.shields.io/pypi/v/django-configurations.svg

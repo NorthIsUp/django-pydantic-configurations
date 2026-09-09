@@ -1,13 +1,36 @@
-import ast
+"""
+The class based settings values.
+
+This is the original interface of django-configurations and it keeps working
+as it always has. It is implemented on top of pydantic now, every value is
+deserialized and validated by a pydantic type adapter.
+
+New code is better served by the :class:`~configurations.env.Env` type
+wrapper, which lets pydantic do the same work from a plain type annotation::
+
+    # instead of
+    DEBUG = values.BooleanValue(False)
+    ADMINS = values.ListValue(["admin@example.com"])
+
+    # write
+    DEBUG: Env[bool] = False
+    ADMINS: Env[list[EmailAddress]] = ["admin@example.com"]
+"""
+
 import copy
 import decimal
 import os
 import sys
+import typing
 
 from django.core import validators
 from django.core.exceptions import ValidationError, ImproperlyConfigured
 from django.utils.module_loading import import_string
+from pydantic import PlainValidator, TypeAdapter
+from pydantic import ValidationError as PydanticValidationError
 
+from .env import parse_env_string
+from .types import Cache, Database, Email, Search, as_settings
 from .utils import getargspec
 
 
@@ -20,6 +43,16 @@ def setup_value(target, name, value):
             setattr(target, multiple_name, multiple_value)
 
 
+def validate(annotation, value, message=None):
+    """Deserialize and validate a value with pydantic."""
+    try:
+        return TypeAdapter(annotation).validate_python(value)
+    except PydanticValidationError as err:
+        if message is None:
+            raise ValueError(str(err)) from err
+        raise ValueError(message.format(value)) from err
+
+
 class Value:
     """
     A single settings value that is able to interpret env variables
@@ -28,6 +61,12 @@ class Value:
     multiple = False
     late_binding = False
     environ_required = False
+
+    #: The type the raw environment string is deserialized into by pydantic.
+    python_type = str
+    #: Separators used to split sequences, one per level of nesting.
+    separators = (',', ';')
+    message = 'Cannot interpret value {0!r}'
 
     @property
     def value(self):
@@ -111,10 +150,13 @@ class Value:
     def to_python(self, value):
         """
         Convert the given value of a environment variable into an
-        appropriate Python representation of the value.
-        This should be overridden when subclassing.
+        appropriate Python representation of the value, using pydantic.
         """
-        return value
+        return validate(
+            self.python_type,
+            parse_env_string(self.python_type, value, self.separators),
+            self.message,
+        )
 
 
 class MultipleMixin:
@@ -122,6 +164,8 @@ class MultipleMixin:
 
 
 class BooleanValue(Value):
+    python_type = bool
+    message = 'Cannot interpret boolean value {0!r}'
     true_values = ('yes', 'y', 'true', '1')
     false_values = ('no', 'n', 'false', '0', '')
 
@@ -137,12 +181,15 @@ class BooleanValue(Value):
             return True
         elif normalized_value in self.false_values:
             return False
-        else:
-            raise ValueError('Cannot interpret '
-                             'boolean value {!r}'.format(value))
+        return validate(bool, normalized_value, self.message)
 
 
 class CastingMixin:
+    """
+    Runs the raw value through a caster before pydantic validates it.
+
+    The caster is either a callable or the dotted path to one.
+    """
     exception = (TypeError, ValueError)
     message = 'Cannot interpret value {0!r}'
 
@@ -158,26 +205,37 @@ class CastingMixin:
             self._caster = self.caster
         else:
             error = 'Cannot use caster of {} ({!r})'.format(self,
-                                                              self.caster)
+                                                            self.caster)
             raise ValueError(error)
         try:
             arg_names = getargspec(self._caster)[0]
             self._params = {name: kwargs[name] for name in arg_names if name in kwargs}
         except TypeError:
             self._params = {}
+        self._adapter = TypeAdapter(
+            typing.Annotated[typing.Any, PlainValidator(self.cast)]
+        )
+
+    def cast(self, value):
+        if self._params:
+            return self._caster(value, **self._params)
+        return self._caster(value)
 
     def to_python(self, value):
+        exceptions = self.exception
+        if not isinstance(exceptions, tuple):
+            exceptions = (exceptions,)
         try:
-            if self._params:
-                return self._caster(value, **self._params)
-            else:
-                return self._caster(value)
-        except self.exception:
+            return self._adapter.validate_python(value)
+        except exceptions:
+            raise ValueError(self.message.format(value))
+        except PydanticValidationError:
             raise ValueError(self.message.format(value))
 
 
 class IntegerValue(CastingMixin, Value):
     caster = int
+    python_type = int
 
 
 class PositiveIntegerValue(IntegerValue):
@@ -191,10 +249,12 @@ class PositiveIntegerValue(IntegerValue):
 
 class FloatValue(CastingMixin, Value):
     caster = float
+    python_type = float
 
 
 class DecimalValue(CastingMixin, Value):
     caster = decimal.Decimal
+    python_type = decimal.Decimal
     exception = decimal.InvalidOperation
 
 
@@ -225,22 +285,36 @@ class SequenceValue(Value):
         if self.converter is not None:
             self.default = self._convert(self.default)
 
+    @property
+    def separators(self):
+        return (self.separator,)
+
+    @property
+    def item_annotation(self):
+        """The pydantic annotation a single item is deserialized with."""
+        if self.converter is None:
+            return str
+        return typing.Annotated[typing.Any, PlainValidator(self.converter)]
+
+    @property
+    def python_type(self):
+        return typing.List[self.item_annotation]
+
+    def _validate(self, annotation, value):
+        try:
+            return validate(annotation, value)
+        except ValueError as err:
+            item = getattr(err, 'item', value)
+            raise ValueError(self.message.format(item, item)) from err
+
     def _convert(self, sequence):
-        converted_values = []
-        for value in sequence:
-            try:
-                converted_values.append(self.converter(value))
-            except (TypeError, ValueError):
-                raise ValueError(self.message.format(value, value))
-        return self.sequence_type(converted_values)
+        return self.sequence_type(
+            self._validate(typing.List[self.item_annotation], sequence)
+        )
 
     def to_python(self, value):
-        split_value = [v.strip() for v in value.strip().split(self.separator)]
-        # removing empty items
-        value_list = self.sequence_type(filter(None, split_value))
-        if self.converter is not None:
-            value_list = self._convert(value_list)
-        return self.sequence_type(value_list)
+        parsed = parse_env_string(self.python_type, value, self.separators)
+        return self.sequence_type(self._validate(self.python_type, parsed))
 
 
 class ListValue(SequenceValue):
@@ -261,25 +335,29 @@ class SingleNestedSequenceValue(SequenceValue):
         self.seq_separator = kwargs.pop('seq_separator', ';')
         super().__init__(*args, **kwargs)
 
+    @property
+    def separators(self):
+        return (self.separator, self.seq_separator)
+
+    @property
+    def python_type(self):
+        return typing.List[typing.List[self.item_annotation]]
+
     def _convert(self, items):
         # This could receive either a bare or nested sequence
         if items and isinstance(items[0], self.sequence_type):
-            converted_sequences = [
-                super(SingleNestedSequenceValue, self)._convert(i) for i in items
-            ]
-            return self.sequence_type(converted_sequences)
-        return self.sequence_type(super()._convert(items))
+            return self.sequence_type(
+                self.sequence_type(inner)
+                for inner in self._validate(self.python_type, items)
+            )
+        return super()._convert(items)
 
     def to_python(self, value):
-        split_value = [
-            v.strip() for v in value.strip().split(self.seq_separator)
-        ]
-        # Remove empty items
-        filtered = self.sequence_type(filter(None, split_value))
-        sequence = [
-            super(SingleNestedSequenceValue, self).to_python(f) for f in filtered
-        ]
-        return self.sequence_type(sequence)
+        parsed = parse_env_string(self.python_type, value, self.separators)
+        return self.sequence_type(
+            self.sequence_type(inner)
+            for inner in self._validate(self.python_type, parsed)
+        )
 
 
 class SingleNestedListValue(SingleNestedSequenceValue):
@@ -315,6 +393,7 @@ class SetValue(ListValue):
 
 
 class DictValue(Value):
+    python_type = dict
     message = 'Cannot interpret dict value {0!r}'
 
     def __init__(self, *args, **kwargs):
@@ -325,16 +404,11 @@ class DictValue(Value):
             self.default = dict(self.default)
 
     def to_python(self, value):
-        value = super().to_python(value)
-        if not value:
-            return {}
         try:
-            evaled_value = ast.literal_eval(value)
-        except ValueError:
-            raise ValueError(self.message.format(value))
-        if not isinstance(evaled_value, dict):
-            raise ValueError(self.message.format(value))
-        return evaled_value
+            parsed = parse_env_string(dict, value, self.separators)
+        except ValueError as err:
+            raise ValueError(self.message.format(value)) from err
+        return validate(dict, parsed, self.message)
 
 
 class ValidationMixin:
@@ -352,16 +426,21 @@ class ValidationMixin:
         else:
             raise ValueError('Cannot use validator of '
                              '{} ({!r})'.format(self, self.validator))
+        self._adapter = TypeAdapter(
+            typing.Annotated[str, PlainValidator(self.run_validator)]
+        )
         if self.default:
             self.to_python(self.default)
 
+    def run_validator(self, value):
+        self._validator(value)
+        return value
+
     def to_python(self, value):
         try:
-            self._validator(value)
-        except ValidationError:
+            return self._adapter.validate_python(value)
+        except (ValidationError, PydanticValidationError):
             raise ValueError(self.message.format(value))
-        else:
-            return value
 
 
 class EmailValue(ValidationMixin, Value):
@@ -418,8 +497,21 @@ class SecretValue(Value):
         return value
 
 
-class EmailURLValue(CastingMixin, MultipleMixin, Value):
+class ModelMixin:
+    """Validates the value the caster returned with a pydantic model."""
+
+    #: The pydantic model the parsed value is validated with.
+    model = None
+
+    def validate_model(self, value):
+        if self.model is None:
+            return value
+        return as_settings(validate(self.model, value, self.message))
+
+
+class EmailURLValue(ModelMixin, CastingMixin, MultipleMixin, Value):
     caster = 'dj_email_url.parse'
+    model = Email
     message = 'Cannot interpret email URL value {0!r}'
     late_binding = True
 
@@ -433,8 +525,11 @@ class EmailURLValue(CastingMixin, MultipleMixin, Value):
         else:
             self.default = self.to_python(self.default)
 
+    def to_python(self, value):
+        return self.validate_model(super().to_python(value))
 
-class DictBackendMixin(Value):
+
+class DictBackendMixin(ModelMixin, Value):
     default_alias = 'default'
 
     def __init__(self, *args, **kwargs):
@@ -450,11 +545,12 @@ class DictBackendMixin(Value):
 
     def to_python(self, value):
         value = super().to_python(value)
-        return {self.alias: value}
+        return {self.alias: self.validate_model(value)}
 
 
 class DatabaseURLValue(DictBackendMixin, CastingMixin, Value):
     caster = 'dj_database_url.parse'
+    model = Database
     message = 'Cannot interpret database URL value {0!r}'
     environ_name = 'DATABASE_URL'
     late_binding = True
@@ -462,6 +558,7 @@ class DatabaseURLValue(DictBackendMixin, CastingMixin, Value):
 
 class CacheURLValue(DictBackendMixin, CastingMixin, Value):
     caster = 'django_cache_url.parse'
+    model = Cache
     message = 'Cannot interpret cache URL value {0!r}'
     environ_name = 'CACHE_URL'
     late_binding = True
@@ -469,6 +566,7 @@ class CacheURLValue(DictBackendMixin, CastingMixin, Value):
 
 class SearchURLValue(DictBackendMixin, CastingMixin, Value):
     caster = 'dj_search_url.parse'
+    model = Search
     message = 'Cannot interpret Search URL value {0!r}'
     environ_name = 'SEARCH_URL'
     late_binding = True

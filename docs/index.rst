@@ -67,6 +67,7 @@ Further documentation
    :maxdepth: 3
 
    patterns
+   env
    values
    cookbook
    changes

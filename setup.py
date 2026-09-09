@@ -31,6 +31,7 @@ setup(
     },
     install_requires=[
         'django>=3.2',
+        'pydantic>=2.5',
     ],
     python_requires='>=3.9, <4.0',
     extras_require={

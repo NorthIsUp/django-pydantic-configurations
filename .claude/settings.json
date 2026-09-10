@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "extraKnownMarketplaces": {
+    "northisup-skillz": {
+      "source": {
+        "source": "github",
+        "repo": "NorthIsUp/skillz"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "skillz@northisup-skillz": true
+  }
+}

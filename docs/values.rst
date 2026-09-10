@@ -6,6 +6,13 @@ Values
 
 .. versionadded:: 0.4
 
+.. note::
+
+  The values classes are the original interface and keep working, they are
+  implemented on top of pydantic now. New code is better served by the
+  :doc:`typed settings<env>`, where the same work is done by a type
+  annotation: ``DEBUG: Env[bool] = True``.
+
 django-configurations allows you to optionally reduce the amount of validation
 and setup code in your **settings.py** by using ``Value`` classes. They have
 the ability to handle values from the process environment of your software

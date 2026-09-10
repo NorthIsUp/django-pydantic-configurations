@@ -6,6 +6,29 @@ Changelog
 Unreleased
 ^^^^^^^^^^
 
+- ``Configuration`` is a pydantic ``BaseModel``. Settings can be declared with
+  a type annotation and are validated by pydantic, and the new ``Env[...]``
+  type wrapper reads and deserializes them from the environment, e.g.
+  ``DEBUG: Env[bool] = False`` or ``DATABASES: Env[Databases]``. See
+  :doc:`typed settings<env>`.
+- New module ``configurations.types`` with the pydantic types Django settings
+  need: ``Databases``, ``Caches``, ``Email``, ``Searches``, ``Secret``,
+  ``Backend``, ``URL``, ``EmailAddress``, ``IPAddress``, ``Path``,
+  ``ExistingPath`` and ``Regex``.
+- The values classes are unchanged in behavior and are now implemented on top
+  of pydantic. ``IntegerValue``, ``FloatValue`` and ``DecimalValue`` no longer
+  go through ``CastingMixin``, which pydantic makes unnecessary for them; the
+  mixin itself is unchanged and still available for custom casters.
+- A setting is deserialized the same way wherever its value comes from, so the
+  configuration of a field, a custom ``separator`` for example, applies to a
+  default written as a string and to a value passed in directly, not only to
+  the value in the environment.
+- A setting whose value is a class or a callable object no longer fails to
+  build.
+- Settings that expand into several settings, such as an email URL, now win
+  over the Django default of the same name regardless of the order the
+  settings are resolved in.
+- Add ``pydantic>=2.5`` as a dependency.
 - Prevent warning about ``FORMS_URLFIELD_ASSUME_HTTPS`` on Django 5.0.
 
 v2.5.1 (2023-11-30)

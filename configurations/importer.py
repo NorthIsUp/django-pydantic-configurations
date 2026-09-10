@@ -8,8 +8,7 @@ from django.conf import ENVIRONMENT_VARIABLE as SETTINGS_ENVIRONMENT_VARIABLE
 from django.core.exceptions import ImproperlyConfigured
 from django.core.management import base
 
-from .utils import uppercase_attributes, reraise
-from .values import Value, setup_value
+from .utils import reraise
 
 installed = False
 
@@ -158,16 +157,7 @@ def wrap_loader(loader, class_name):
             try:
                 cls.pre_setup()
                 cls.setup()
-                obj = cls()
-                attributes = uppercase_attributes(obj).items()
-                for name, value in attributes:
-                    if callable(value) and not getattr(value, 'pristine', False):
-                        value = value()
-                        # in case a method returns a Value instance we have
-                        # to do the same as the Configuration.setup method
-                        if isinstance(value, Value):
-                            setup_value(mod, name, value)
-                            continue
+                for name, value in cls.settings().items():
                     setattr(mod, name, value)
 
                 setattr(mod, 'CONFIGURATION', '{0}.{1}'.format(module.__name__,

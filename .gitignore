@@ -10,3 +10,4 @@ htmlcov/
 *.pyc
 dist/
 .eggs/
+.venv/

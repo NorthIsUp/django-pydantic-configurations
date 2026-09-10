@@ -233,8 +233,7 @@ class CastingMixin:
             raise ValueError(self.message.format(value))
 
 
-class IntegerValue(CastingMixin, Value):
-    caster = int
+class IntegerValue(Value):
     python_type = int
 
 
@@ -247,15 +246,12 @@ class PositiveIntegerValue(IntegerValue):
         return int_value
 
 
-class FloatValue(CastingMixin, Value):
-    caster = float
+class FloatValue(Value):
     python_type = float
 
 
-class DecimalValue(CastingMixin, Value):
-    caster = decimal.Decimal
+class DecimalValue(Value):
     python_type = decimal.Decimal
-    exception = decimal.InvalidOperation
 
 
 class SequenceValue(Value):
@@ -275,6 +271,8 @@ class SequenceValue(Value):
         converter = kwargs.pop('converter', None)
         if converter is not None:
             self.converter = converter
+        self.separators = self._build_separators()
+        self.python_type = self._build_python_type()
         super().__init__(*args, **kwargs)
         # make sure the default is the correct sequence type
         if self.default is None:
@@ -286,18 +284,16 @@ class SequenceValue(Value):
             self.default = self._convert(self.default)
 
     @property
-    def separators(self):
-        return (self.separator,)
-
-    @property
     def item_annotation(self):
         """The pydantic annotation a single item is deserialized with."""
         if self.converter is None:
             return str
         return typing.Annotated[typing.Any, PlainValidator(self.converter)]
 
-    @property
-    def python_type(self):
+    def _build_separators(self):
+        return (self.separator,)
+
+    def _build_python_type(self):
         return typing.List[self.item_annotation]
 
     def _validate(self, annotation, value):
@@ -335,12 +331,10 @@ class SingleNestedSequenceValue(SequenceValue):
         self.seq_separator = kwargs.pop('seq_separator', ';')
         super().__init__(*args, **kwargs)
 
-    @property
-    def separators(self):
+    def _build_separators(self):
         return (self.separator, self.seq_separator)
 
-    @property
-    def python_type(self):
+    def _build_python_type(self):
         return typing.List[typing.List[self.item_annotation]]
 
     def _convert(self, items):

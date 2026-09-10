@@ -115,6 +115,10 @@ Empty items are dropped, so ``a, b ,`` is a list of two items. A value that
 starts with ``[`` or ``{`` is read as JSON, with a Python literal as the
 fallback, which is handy for a mapping that has to be written on one line.
 
+A setting is deserialized the same way wherever it comes from, so a
+``separator`` applies to the value in the environment, to a default written
+as a string, and to a value passed to the configuration directly.
+
 Because ``Env[T]`` is a plain ``typing.Annotated`` alias, it works anywhere
 pydantic does:
 
@@ -139,6 +143,22 @@ URL based settings
 These parse a URL into the structure Django expects. They need the matching
 optional dependency, install them with
 ``pip install django-configurations[cache,database,email,search]``.
+
+They are built from two bases you can use for your own settings:
+
+.. class:: UrlModel
+
+   A setting written as a URL. A subclass names the module whose ``parse``
+   function reads the URL (``url_parser``), the setting it stands for
+   (``url_setting``) and the packaging extra that provides the parser
+   (``url_extra``).
+
+.. class:: AliasedSettings
+
+   A mapping of alias to backend, the shape Django uses for ``DATABASES``
+   and friends. Subscript it with the model of one entry, as in
+   ``class Queues(AliasedSettings[Queue])``. A bare URL is read as the
+   ``default`` alias.
 
 .. class:: Databases
 

@@ -4,15 +4,16 @@ import typing
 from contextlib import contextmanager
 from unittest.mock import patch
 
+from django.core.exceptions import ImproperlyConfigured
 from django.test import TestCase
 from pydantic import TypeAdapter, ValidationError
 
 from configurations.env import (DEFAULT_PREFIX, Env, EnvConfig,
                                 environ_name, parse_env_string)
-from configurations.types import (Backend, Cache, Caches, Database, Databases,
-                                  Email, EmailAddress, ExistingPath, IPAddress,
-                                  Path, Regex, Search, Searches, Secret, URL,
-                                  as_settings)
+from configurations.types import (AliasedSettings, Backend, Cache, Caches,
+                                  Database, Databases, Email, EmailAddress,
+                                  ExistingPath, IPAddress, Path, Regex, Search,
+                                  Searches, Secret, URL, UrlModel, as_settings)
 
 
 @contextmanager
@@ -263,3 +264,52 @@ class SettingsModelTests(TestCase):
                              'USER': '',
                          }]})
         self.assertEqual(as_settings('spam'), 'spam')
+
+
+class SharedBaseTests(TestCase):
+    """The bases the built-in settings models are built from are reusable."""
+
+    def test_url_model(self):
+        class Queue(UrlModel):
+            url_parser = 'dj_database_url'
+            url_setting = 'QUEUES'
+            url_extra = 'database'
+
+            ENGINE: str
+
+        self.assertEqual(read(Queue, 'sqlite://').ENGINE,
+                         'django.db.backends.sqlite3')
+
+    def test_url_model_names_the_missing_package(self):
+        class Queue(UrlModel):
+            url_parser = 'not_a_real_url_package'
+            url_setting = 'QUEUES'
+            url_extra = 'queue'
+
+            ENGINE: str = ''
+
+        with self.assertRaises(ImproperlyConfigured) as cm:
+            read(Queue, 'amqp://')
+        self.assertIn('not_a_real_url_package', str(cm.exception))
+
+    def test_aliased_settings(self):
+        class Queue(UrlModel):
+            url_parser = 'dj_database_url'
+            url_setting = 'QUEUES'
+            url_extra = 'database'
+
+            ENGINE: str
+
+        class Queues(AliasedSettings[Queue]):
+            """A mapping of alias to queue."""
+
+        queues = read(Queues, 'sqlite://')
+        self.assertEqual(list(queues), ['default'])
+        self.assertIsInstance(queues['default'], Queue)
+        self.assertEqual(len(queues), 1)
+
+    def test_the_built_in_mappings_share_that_base(self):
+        for model in (Databases, Caches, Searches):
+            self.assertTrue(issubclass(model, AliasedSettings))
+        for model in (Database, Cache, Email, Search):
+            self.assertTrue(issubclass(model, UrlModel))

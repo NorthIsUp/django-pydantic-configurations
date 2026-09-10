@@ -19,8 +19,10 @@ are plain class attributes and are copied to the settings module untouched.
 from __future__ import annotations
 
 import copy
+import functools
 import os
 import re
+import types
 import typing
 import warnings
 
@@ -31,7 +33,7 @@ from pydantic import ValidationError as PydanticValidationError
 from pydantic._internal._model_construction import ModelMetaclass
 from pydantic_core import PydanticUndefined
 
-from .env import UNSET, env_config, environ_name, read_environ
+from .env import UNSET, env_config, environ_name, resolve_env_fields
 from .types import as_settings
 from .utils import isuppercase, uppercase_attributes
 from .values import Value, setup_value
@@ -53,9 +55,130 @@ def _is_class_var(annotation):
             or typing.get_origin(annotation) is typing.ClassVar)
 
 
+#: What pydantic accepts in a model namespace without an annotation. Anything
+#: else has to be marked, which is what :func:`_mark_class_variables` does. The
+#: test suite pins this, so a change on their side fails loudly rather than
+#: crashing a configuration that happens to hold one of these.
+PYDANTIC_IGNORES = (
+    property,
+    functools.cached_property,
+    classmethod,
+    staticmethod,
+    functools.partial,
+    types.FunctionType,
+    types.BuiltinFunctionType,
+    types.MethodType,
+)
+
+
 def _is_pydantic_ignored(value):
     """Whether pydantic leaves an unannotated class attribute alone."""
-    return isinstance(value, (property, classmethod, staticmethod, type)) or callable(value)
+    return isinstance(value, PYDANTIC_IGNORES)
+
+
+def _check_importer_installed():
+    """A configuration is only usable once the settings importer is in place."""
+    from . import importer
+    if not importer.installed:
+        raise ImproperlyConfigured(install_failure)
+
+
+def _django_defaults(bases):
+    """
+    The settings a configuration starts from: the Django defaults, updated
+    with what its parents carry, minus the ones Django deprecated.
+    """
+    defaults = uppercase_attributes(global_settings)
+    for base in bases[::-1]:
+        defaults.update(uppercase_attributes(base))
+
+    deprecated = {
+        # DEFAULT_HASHING_ALGORITHM is always deprecated, as it's a
+        # transitional setting
+        # https://docs.djangoproject.com/en/3.1/releases/3.1/#default-hashing-algorithm-settings
+        "DEFAULT_HASHING_ALGORITHM",
+        # DEFAULT_CONTENT_TYPE and FILE_CHARSET are deprecated in
+        # Django 2.2 and are removed in Django 3.0
+        "DEFAULT_CONTENT_TYPE",
+        "FILE_CHARSET",
+        # When DEFAULT_AUTO_FIELD is not explicitly set, Django's emits a
+        # system check warning models.W042. This warning should not be
+        # suppressed, as downstream users are expected to make a decision.
+        # https://docs.djangoproject.com/en/3.2/releases/3.2/#customizing-type-of-auto-created-primary-keys
+        "DEFAULT_AUTO_FIELD",
+        # FORMS_URLFIELD_ASSUME_HTTPS is a transitional setting introduced
+        # in Django 5.0.
+        # https://docs.djangoproject.com/en/5.0/releases/5.0/#id2
+        "FORMS_URLFIELD_ASSUME_HTTPS",
+    }
+    # PASSWORD_RESET_TIMEOUT_DAYS is deprecated in favor of
+    # PASSWORD_RESET_TIMEOUT in Django 3.1
+    # https://github.com/django/django/commit/226ebb17290b604ef29e82fb5c1fbac3594ac163#diff-ec2bed07bb264cb95a80f08d71a47c06R163-R170
+    if "PASSWORD_RESET_TIMEOUT" in defaults:
+        deprecated.add("PASSWORD_RESET_TIMEOUT_DAYS")
+    # DEFAULT_FILE_STORAGE and STATICFILES_STORAGE are deprecated
+    # in favor of STORAGES.
+    # https://docs.djangoproject.com/en/dev/releases/4.2/#custom-file-storages
+    if "STORAGES" in defaults:
+        deprecated.add("DEFAULT_FILE_STORAGE")
+        deprecated.add("STATICFILES_STORAGE")
+    for setting in deprecated:
+        defaults.pop(setting, None)
+    return defaults
+
+
+def _inherited_fields(bases):
+    """The pydantic fields this configuration inherits from its parents."""
+    fields = {}
+    for base in bases[::-1]:
+        fields.update(getattr(base, 'model_fields', None) or {})
+    return fields
+
+
+def _redeclare(attrs, annotations, inherited_fields):
+    """
+    Redeclare the fields of the parents in this namespace.
+
+    Every configuration carries the Django defaults as class attributes, and
+    an attribute of the same name on a parent is what pydantic would take as
+    the default of an inherited field. Redeclaring them keeps that out of
+    reach.
+    """
+    for field_name, field in inherited_fields.items():
+        if field_name in annotations or field_name in attrs:
+            continue
+        annotations[field_name] = field.rebuild_annotation()
+        redeclared = copy.copy(field)
+        # the metadata is already carried by the rebuilt annotation
+        redeclared.metadata = []
+        attrs[field_name] = redeclared
+
+
+def _mark_required(attrs, annotations, own_annotations):
+    """
+    Mark the settings this class annotates without a default as required.
+
+    The Django default of the same name lives on a parent class, where
+    pydantic would find it and turn a required setting into an optional one.
+    The sentinel is what pydantic itself uses for "no default given".
+    """
+    for name, annotation in own_annotations.items():
+        if name not in attrs and not _is_class_var(annotation):
+            attrs[name] = PydanticUndefined
+
+
+def _mark_class_variables(attrs, annotations):
+    """
+    Annotate the settings that are not typed as class variables.
+
+    Pydantic refuses to build a model with attributes that have no
+    annotation, and marking them leaves them exactly where they are.
+    """
+    for name, value in attrs.items():
+        if (isuppercase(name)
+                and name not in annotations
+                and not _is_pydantic_ignored(value)):
+            annotations[name] = typing.ClassVar[typing.Any]
 
 
 class ConfigurationBase(ModelMetaclass):
@@ -63,97 +186,25 @@ class ConfigurationBase(ModelMetaclass):
     def __new__(cls, name, bases, attrs, **kwargs):
         parents = [base for base in bases if isinstance(base, ConfigurationBase)]
         if parents:
-            # if this is actually a subclass in a settings module
-            # we better check if the importer was correctly installed
-            from . import importer
-            if not importer.installed:
-                raise ImproperlyConfigured(install_failure)
-
-        settings_vars = uppercase_attributes(global_settings)
-        if parents:
-            for base in bases[::-1]:
-                settings_vars.update(uppercase_attributes(base))
+            _check_importer_installed()
 
         own_annotations = dict(attrs.get('__annotations__') or {})
+        defaults = _django_defaults(bases) if parents else _django_defaults(())
+        inherited_fields = _inherited_fields(bases)
 
-        deprecated_settings = {
-            # DEFAULT_HASHING_ALGORITHM is always deprecated, as it's a
-            # transitional setting
-            # https://docs.djangoproject.com/en/3.1/releases/3.1/#default-hashing-algorithm-settings
-            "DEFAULT_HASHING_ALGORITHM",
-            # DEFAULT_CONTENT_TYPE and FILE_CHARSET are deprecated in
-            # Django 2.2 and are removed in Django 3.0
-            "DEFAULT_CONTENT_TYPE",
-            "FILE_CHARSET",
-            # When DEFAULT_AUTO_FIELD is not explicitly set, Django's emits a
-            # system check warning models.W042. This warning should not be
-            # suppressed, as downstream users are expected to make a decision.
-            # https://docs.djangoproject.com/en/3.2/releases/3.2/#customizing-type-of-auto-created-primary-keys
-            "DEFAULT_AUTO_FIELD",
-            # FORMS_URLFIELD_ASSUME_HTTPS is a transitional setting introduced
-            # in Django 5.0.
-            # https://docs.djangoproject.com/en/5.0/releases/5.0/#id2
-            "FORMS_URLFIELD_ASSUME_HTTPS"
-        }
-        # PASSWORD_RESET_TIMEOUT_DAYS is deprecated in favor of
-        # PASSWORD_RESET_TIMEOUT in Django 3.1
-        # https://github.com/django/django/commit/226ebb17290b604ef29e82fb5c1fbac3594ac163#diff-ec2bed07bb264cb95a80f08d71a47c06R163-R170
-        if "PASSWORD_RESET_TIMEOUT" in settings_vars:
-            deprecated_settings.add("PASSWORD_RESET_TIMEOUT_DAYS")
-        # DEFAULT_FILE_STORAGE and STATICFILES_STORAGE are deprecated
-        # in favor of STORAGES.
-        # https://docs.djangoproject.com/en/dev/releases/4.2/#custom-file-storages
-        if "STORAGES" in settings_vars:
-            deprecated_settings.add("DEFAULT_FILE_STORAGE")
-            deprecated_settings.add("STATICFILES_STORAGE")
-        for deprecated_setting in deprecated_settings:
-            settings_vars.pop(deprecated_setting, None)
-
-        # a setting that a parent declared as a pydantic field is inherited as
-        # a field, it must not be shadowed by the Django default of the same
-        # name
-        inherited_fields = {}
-        for base in bases[::-1]:
-            inherited_fields.update(getattr(base, 'model_fields', None) or {})
+        # a setting this class annotates itself, and one a parent declared as
+        # a field, are owned by the configuration rather than by Django
         for field_name in inherited_fields:
-            settings_vars.pop(field_name, None)
+            defaults.pop(field_name, None)
+        for field_name in own_annotations:
+            defaults.pop(field_name, None)
 
-        # a setting this class annotates itself is defined by this class
-        # alone. The Django default of the same name must not become its
-        # default, that would turn a required setting into an optional one
-        for annotated_name, annotation in own_annotations.items():
-            settings_vars.pop(annotated_name, None)
-
-        attrs = {**settings_vars, **attrs}
+        attrs = {**defaults, **attrs}
         annotations = dict(attrs.get('__annotations__') or {})
 
-        # the Django defaults also live on the parent classes, where pydantic
-        # picks them up as the default of an annotated setting. The sentinel
-        # marks the ones that are declared without a default as required.
-        for annotated_name, annotation in own_annotations.items():
-            if annotated_name not in attrs and not _is_class_var(annotation):
-                attrs[annotated_name] = PydanticUndefined
-
-        # every configuration carries the Django defaults as class attributes,
-        # which is exactly what shadows an inherited field. Redeclaring the
-        # fields of the parents keeps them out of reach.
-        for field_name, field in inherited_fields.items():
-            if field_name in annotations or field_name in attrs:
-                continue
-            annotations[field_name] = field.rebuild_annotation()
-            redeclared = copy.copy(field)
-            # the metadata is already carried by the rebuilt annotation
-            redeclared.metadata = []
-            attrs[field_name] = redeclared
-
-        # pydantic refuses to build a model with attributes that have no
-        # annotation, so the settings that are not typed are marked as class
-        # variables, which leaves them exactly where they are
-        for attr_name, value in attrs.items():
-            if (isuppercase(attr_name)
-                    and attr_name not in annotations
-                    and not _is_pydantic_ignored(value)):
-                annotations[attr_name] = typing.ClassVar[typing.Any]
+        _redeclare(attrs, annotations, inherited_fields)
+        _mark_required(attrs, annotations, own_annotations)
+        _mark_class_variables(attrs, annotations)
         attrs['__annotations__'] = annotations
 
         with warnings.catch_warnings():
@@ -207,23 +258,13 @@ class Configuration(BaseModel, metaclass=ConfigurationBase):
 
     DOTENV_LOADED = None
 
-    #: The configured instance, cached per configuration class.
-    _instance: typing.ClassVar[typing.Any] = None
-
     @model_validator(mode='before')
     @classmethod
     def _read_environment(cls, data):
-        """Fill the fields annotated with ``Env`` from the environment."""
+        """Deserialize the settings annotated with ``Env``."""
         if not isinstance(data, dict):
             return data
-        values = dict(data)
-        for name, field in cls.model_fields.items():
-            if name in values:
-                continue
-            found, value = read_environ(name, field)
-            if found:
-                values[name] = value
-        return values
+        return resolve_env_fields(cls.model_fields, data)
 
     @classmethod
     def load_dotenv(cls):
@@ -278,19 +319,15 @@ class Configuration(BaseModel, metaclass=ConfigurationBase):
     @classmethod
     def configured(cls):
         """
-        The validated instance of this configuration.
+        Build and validate an instance of this configuration.
 
         Building it reads the environment and lets pydantic deserialize and
         validate every typed setting.
         """
-        instance = cls.__dict__.get('_instance')
-        if instance is None:
-            try:
-                instance = cls()
-            except PydanticValidationError as err:
-                raise ImproperlyConfigured(_error_message(cls, err)) from err
-            type.__setattr__(cls, '_instance', instance)
-        return instance
+        try:
+            return cls()
+        except PydanticValidationError as err:
+            raise ImproperlyConfigured(_error_message(cls, err)) from err
 
     @classmethod
     def setup(cls):
@@ -306,9 +343,9 @@ class Configuration(BaseModel, metaclass=ConfigurationBase):
         instance = cls.configured()
         fields = type(instance).model_fields
         for name, field in fields.items():
-            setting, expanded = _export(name, getattr(instance, name), field)
-            for attr_name, value in {**setting, **expanded}.items():
-                type.__setattr__(cls, attr_name, value)
+            for setting, value in _contributions(name, getattr(instance, name),
+                                                 field).items():
+                setattr(cls, setting, value)
 
     @classmethod
     def settings(cls):
@@ -326,22 +363,17 @@ class Configuration(BaseModel, metaclass=ConfigurationBase):
             attributes[name] = getattr(instance, name)
 
         resolved = {}
+        # a setting that stands for several settings wins over the Django
+        # default of the same name, no matter the order they are resolved in
         expanded = {}
         for name, value in attributes.items():
             if (name not in fields
                     and callable(value)
                     and not getattr(value, 'pristine', False)):
                 value = value()
-            if isinstance(value, Value):
-                # a Value can also be returned by a method, it is set up the
-                # same way as one that is a class attribute
-                setting, extra = _expand_value(name, value)
-            else:
-                setting, extra = _export(name, value, fields.get(name))
-            resolved.update(setting)
-            expanded.update(extra)
-        # a setting that expands into several settings wins over the Django
-        # default of the same name, no matter the order they are resolved in
+            contributions = _contributions(name, value, fields.get(name))
+            resolved[name] = contributions.pop(name)
+            expanded.update(contributions)
         resolved.update(expanded)
         return resolved
 
@@ -361,38 +393,37 @@ def _error_message(cls, error):
     return '\n'.join(lines)
 
 
-def _expand_value(name, value):
+def _expands(value, field=None):
+    """Whether a setting is written as the several settings it stands for."""
+    config = env_config(field) if field is not None else None
+    if config is not None and config.expand is not UNSET:
+        return config.resolved_expand
+    if isinstance(value, Value):
+        return value.multiple
+    return getattr(value, 'settings_expand', False)
+
+
+def _contributions(name, value, field=None):
     """
-    Resolve a legacy ``Value`` into the settings it stands for.
+    Every setting a resolved value contributes, keyed by name.
 
-    Returns the setting itself and the settings it expands into.
-    """
-    resolved = value.setup(name)
-    if value.multiple:
-        return {name: value.value}, dict(resolved)
-    return {name: value.value}, {}
-
-
-def _export(name, value, field=None):
-    """
-    Turn a resolved setting into the settings it stands for.
-
-    Returns the setting itself and the settings it expands into, pydantic
+    The setting itself always comes first, and a value that stands for
+    several settings, an email URL for example, adds them beside it. Pydantic
     models are dumped into the plain structures Django expects.
     """
-    if isinstance(value, BaseModel):
-        expand = getattr(value, 'settings_expand', False)
-        config = env_config(field) if field is not None else None
-        if config is not None and config.expand is not UNSET:
-            expand = config.resolved_expand
-        dumped = as_settings(value)
-        if expand:
-            if not isinstance(dumped, dict):
-                raise ImproperlyConfigured(
-                    f'The setting {name!r} cannot be expanded into several '
-                    f'settings, it is not a mapping'
-                )
-            # the setting itself is kept next to the settings it expands into
-            return {name: dumped}, dict(dumped)
-        return {name: dumped}, {}
-    return {name: as_settings(value)}, {}
+    if isinstance(value, Value):
+        # a Value can also be returned by a method, it is set up the same way
+        # as one that is a class attribute
+        expansion = value.setup(name)
+        settings = {name: value.value}
+    else:
+        settings = {name: as_settings(value)}
+        expansion = settings[name]
+    if not _expands(value, field):
+        return settings
+    if not isinstance(expansion, dict):
+        raise ImproperlyConfigured(
+            f'The setting {name!r} cannot be written as several settings, '
+            f'it is not a mapping'
+        )
+    return {**settings, **expansion}

@@ -45,6 +45,7 @@ __all__ = [
     'DEFAULT_PREFIX',
     'DEFAULT_SEPARATORS',
     'parse_env_string',
+    'resolve_env_fields',
     'env_config',
     'environ_name',
 ]
@@ -216,7 +217,7 @@ class Env:
 
 def _build_annotation(item):
     return typing.Annotated[
-        item, EnvConfig(), BeforeValidator(_string_parser(item))
+        item, EnvConfig(), BeforeValidator(_standalone_parser(item))
     ]
 
 
@@ -392,8 +393,16 @@ def parse_env_string(annotation, value, separators=DEFAULT_SEPARATORS):
     return value
 
 
-def _string_parser(annotation):
-    """Build the before validator used by ``Env[annotation]``."""
+def _standalone_parser(annotation):
+    """
+    Build the validator that lets ``Env[T]`` work on its own, outside a
+    configuration, as in ``TypeAdapter(Env[list[int]])``.
+
+    Inside a configuration :func:`resolve_env_fields` has already parsed the
+    value with the settings of its field, so this sees a parsed value and
+    passes it through. Only a standalone adapter, which has no field and so
+    no configuration to read, reaches the parser here.
+    """
 
     def parse(value):
         return parse_env_string(annotation, value)
@@ -402,26 +411,47 @@ def _string_parser(annotation):
     return parse
 
 
-def read_environ(field_name, field: FieldInfo, environ=None):
+def _raw_value(field_name, field: FieldInfo, config: EnvConfig, values, environ):
     """
-    Look up the environment variable of a field.
+    The unparsed value of an environment backed field.
 
-    Returns a ``(found, value)`` tuple where ``value`` is the deserialized
-    Python structure, ready to be validated by pydantic.
+    A setting can be given explicitly, come from the environment or fall back
+    to its default. Returns ``UNSET`` when there is nothing to parse.
     """
-    config = env_config(field)
-    if config is None:
-        return False, None
-    if environ is None:
-        environ = os.environ
+    if field_name in values:
+        return values[field_name]
     name = config.environ_name(field_name)
-    if name not in environ:
-        if config.resolved_required:
-            raise ValueError(
-                f'Setting {field_name!r} is required to be set as the '
-                f'environment variable {name!r}'
-            )
-        return False, None
-    return True, parse_env_string(
-        field.annotation, environ[name], config.resolved_separators
-    )
+    if name in environ:
+        return environ[name]
+    if config.resolved_required:
+        raise ValueError(
+            f'Setting {field_name!r} is required to be set as the '
+            f'environment variable {name!r}'
+        )
+    if isinstance(field.default, str):
+        # a default written the way the environment would write it
+        return field.default
+    return UNSET
+
+
+def resolve_env_fields(fields, values, environ=None):
+    """
+    Deserialize every environment backed field of a model, in one pass.
+
+    This is the only place a setting is parsed, which is what keeps the
+    configuration of a field, a custom separator for example, from applying
+    to the value in the environment but not to the default beside it.
+    """
+    environ = os.environ if environ is None else environ
+    resolved = dict(values)
+    for field_name, field in fields.items():
+        config = env_config(field)
+        if config is None:
+            continue
+        raw = _raw_value(field_name, field, config, resolved, environ)
+        if raw is UNSET:
+            continue
+        resolved[field_name] = parse_env_string(
+            field.annotation, raw, config.resolved_separators
+        )
+    return resolved

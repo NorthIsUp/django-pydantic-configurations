@@ -37,6 +37,8 @@ from pydantic import (
 
 __all__ = [
     'SettingsModel',
+    'UrlModel',
+    'AliasedSettings',
     'Database',
     'Databases',
     'Cache',
@@ -86,6 +88,59 @@ class SettingsModel(SettingsMixin, BaseModel):
     model_config = ConfigDict(extra='allow')
 
 
+class UrlModel(SettingsModel):
+    """
+    A setting that is written as a URL and parsed by one of the ``dj-*-url``
+    packages. Subclasses name the package and the setting they stand for.
+    """
+
+    #: The module whose ``parse`` function reads the URL.
+    url_parser: typing.ClassVar[str]
+    #: The Django setting this model stands for, used in error messages.
+    url_setting: typing.ClassVar[str]
+    #: The packaging extra that provides the parser.
+    url_extra: typing.ClassVar[str]
+
+    @model_validator(mode='before')
+    @classmethod
+    def _parse_url(cls, value):
+        if isinstance(value, str):
+            parse = _import_parser(cls.url_parser, cls.url_setting, cls.url_extra)
+            return parse(value)
+        return value
+
+
+EntryT = typing.TypeVar('EntryT', bound=BaseModel)
+
+
+class AliasedSettings(SettingsMixin, RootModel[typing.Dict[str, EntryT]],
+                      typing.Generic[EntryT]):
+    """
+    A setting that maps an alias to a backend, the shape Django uses for
+    ``DATABASES``, ``CACHES`` and ``HAYSTACK_CONNECTIONS``.
+
+    A bare URL is read as the ``default`` alias.
+    """
+
+    root: typing.Dict[str, EntryT] = Field(default_factory=dict)
+
+    @model_validator(mode='before')
+    @classmethod
+    def _default_alias(cls, value):
+        if isinstance(value, str):
+            return {'default': value}
+        return value
+
+    def __getitem__(self, alias):
+        return self.root[alias]
+
+    def __iter__(self):
+        return iter(self.root)
+
+    def __len__(self):
+        return len(self.root)
+
+
 def as_settings(value):
     """
     Recursively turn pydantic models into the plain Python values Django wants.
@@ -103,13 +158,17 @@ def as_settings(value):
     return value
 
 
-class Database(SettingsModel):
+class Database(UrlModel):
     """
     A single entry of the ``DATABASES`` setting.
 
     Accepts a database URL, which is parsed by ``dj_database_url``, or the
     mapping Django itself uses.
     """
+
+    url_parser = 'dj_database_url'
+    url_setting = 'DATABASES'
+    url_extra = 'database'
 
     ENGINE: str
     NAME: typing.Optional[str] = ''
@@ -126,47 +185,26 @@ class Database(SettingsModel):
     OPTIONS: typing.Dict[str, typing.Any] = Field(default_factory=dict)
     TEST: typing.Dict[str, typing.Any] = Field(default_factory=dict)
 
-    @model_validator(mode='before')
-    @classmethod
-    def _parse_url(cls, value):
-        if isinstance(value, str):
-            return _import_parser('dj_database_url', 'DATABASES', 'database')(value)
-        return value
 
-
-class Databases(SettingsMixin, RootModel):
+class Databases(AliasedSettings[Database]):
     """
     The ``DATABASES`` setting, a mapping of alias to :class:`Database`.
 
     A bare database URL is read as the ``default`` database.
     """
 
-    root: typing.Dict[str, Database] = Field(default_factory=dict)
 
-    @model_validator(mode='before')
-    @classmethod
-    def _default_alias(cls, value):
-        if isinstance(value, str):
-            return {'default': value}
-        return value
-
-    def __getitem__(self, alias):
-        return self.root[alias]
-
-    def __iter__(self):
-        return iter(self.root)
-
-    def __len__(self):
-        return len(self.root)
-
-
-class Cache(SettingsModel):
+class Cache(UrlModel):
     """
     A single entry of the ``CACHES`` setting.
 
     Accepts a cache URL, which is parsed by ``django_cache_url``, or the
     mapping Django itself uses.
     """
+
+    url_parser = 'django_cache_url'
+    url_setting = 'CACHES'
+    url_extra = 'cache'
 
     BACKEND: str
     LOCATION: typing.Union[str, typing.List[str], None] = ''
@@ -175,41 +213,16 @@ class Cache(SettingsModel):
     TIMEOUT: typing.Optional[int] = 300
     OPTIONS: typing.Dict[str, typing.Any] = Field(default_factory=dict)
 
-    @model_validator(mode='before')
-    @classmethod
-    def _parse_url(cls, value):
-        if isinstance(value, str):
-            return _import_parser('django_cache_url', 'CACHES', 'cache')(value)
-        return value
 
-
-class Caches(SettingsMixin, RootModel):
+class Caches(AliasedSettings[Cache]):
     """
     The ``CACHES`` setting, a mapping of alias to :class:`Cache`.
 
     A bare cache URL is read as the ``default`` cache.
     """
 
-    root: typing.Dict[str, Cache] = Field(default_factory=dict)
 
-    @model_validator(mode='before')
-    @classmethod
-    def _default_alias(cls, value):
-        if isinstance(value, str):
-            return {'default': value}
-        return value
-
-    def __getitem__(self, alias):
-        return self.root[alias]
-
-    def __iter__(self):
-        return iter(self.root)
-
-    def __len__(self):
-        return len(self.root)
-
-
-class Email(SettingsModel):
+class Email(UrlModel):
     """
     The email settings, parsed from an email URL by ``dj_email_url``.
 
@@ -219,6 +232,10 @@ class Email(SettingsModel):
     """
 
     settings_expand = True
+
+    url_parser = 'dj_email_url'
+    url_setting = 'EMAIL'
+    url_extra = 'email'
 
     EMAIL_BACKEND: str
     EMAIL_HOST: typing.Optional[str] = None
@@ -230,55 +247,26 @@ class Email(SettingsModel):
     EMAIL_TIMEOUT: typing.Optional[int] = None
     EMAIL_FILE_PATH: typing.Optional[str] = None
 
-    @model_validator(mode='before')
-    @classmethod
-    def _parse_url(cls, value):
-        if isinstance(value, str):
-            return _import_parser('dj_email_url', 'EMAIL', 'email')(value)
-        return value
 
-
-class Search(SettingsModel):
+class Search(UrlModel):
     """A single entry of the haystack ``HAYSTACK_CONNECTIONS`` setting."""
+
+    url_parser = 'dj_search_url'
+    url_setting = 'HAYSTACK_CONNECTIONS'
+    url_extra = 'search'
 
     ENGINE: str
     URL: typing.Optional[str] = None
     INDEX_NAME: typing.Optional[str] = None
 
-    @model_validator(mode='before')
-    @classmethod
-    def _parse_url(cls, value):
-        if isinstance(value, str):
-            return _import_parser(
-                'dj_search_url', 'HAYSTACK_CONNECTIONS', 'search'
-            )(value)
-        return value
 
-
-class Searches(SettingsMixin, RootModel):
+class Searches(AliasedSettings[Search]):
     """
-    The ``HAYSTACK_CONNECTIONS`` setting, a mapping of alias to :class:`Search`.
+    The ``HAYSTACK_CONNECTIONS`` setting, a mapping of alias to
+    :class:`Search`.
 
     A bare search URL is read as the ``default`` connection.
     """
-
-    root: typing.Dict[str, Search] = Field(default_factory=dict)
-
-    @model_validator(mode='before')
-    @classmethod
-    def _default_alias(cls, value):
-        if isinstance(value, str):
-            return {'default': value}
-        return value
-
-    def __getitem__(self, alias):
-        return self.root[alias]
-
-    def __iter__(self):
-        return iter(self.root)
-
-    def __len__(self):
-        return len(self.root)
 
 
 def _django_validator(validator, message):

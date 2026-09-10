@@ -4,7 +4,13 @@ from unittest.mock import patch
 from django.core.exceptions import ImproperlyConfigured
 from django.test import TestCase
 
+from typing import List
+
+from pydantic import BaseModel
+from pydantic.errors import PydanticUserError
+
 from configurations import Configuration
+from configurations.base import PYDANTIC_IGNORES
 from configurations.env import Env
 from configurations.types import Databases, Email, Secret
 
@@ -212,6 +218,42 @@ class ConfigurationTests(TestCase):
         with patch.dict(os.environ, clear=True, DJANGO_DEBUG='yes'):
             self.assertIs(Child.settings()['DEBUG'], True)
 
+    def test_configuration_is_deserialized_the_same_way_from_every_source(self):
+        """The field configuration applies wherever the value comes from."""
+        class Sub(Configuration):
+            PATHS: Env[List[str]] = Env(default='/usr/bin:/usr/sbin',
+                                        separator=':')
+
+        with patch.dict(os.environ, clear=True, DJANGO_PATHS='/spam:/eggs'):
+            self.assertEqual(Sub.settings()['PATHS'], ['/spam', '/eggs'])
+        with patch.dict(os.environ, clear=True):
+            self.assertEqual(Sub.settings()['PATHS'], ['/usr/bin', '/usr/sbin'])
+        self.assertEqual(Sub(PATHS='/spam:/eggs').PATHS, ['/spam', '/eggs'])
+
+    def test_setup_reads_the_environment_every_time(self):
+        class Sub(Configuration):
+            NAME: Env[str] = 'default'
+
+        with patch.dict(os.environ, clear=True, DJANGO_NAME='first'):
+            Sub.setup()
+            self.assertEqual(Sub.NAME, 'first')
+        with patch.dict(os.environ, clear=True, DJANGO_NAME='second'):
+            Sub.setup()
+            self.assertEqual(Sub.NAME, 'second')
+
+    def test_settings_that_hold_a_class_or_an_instance(self):
+        class Handler:
+            def __call__(self):
+                return 'called'
+
+        class Sub(Configuration):
+            STORAGE_CLASS = dict
+            HANDLER = Handler()
+
+        settings = Sub.settings()
+        self.assertEqual(settings['STORAGE_CLASS'], {})
+        self.assertEqual(settings['HANDLER'], 'called')
+
     def test_untyped_settings_keep_working(self):
         class Sub(Configuration):
             SPAM = 'eggs'
@@ -227,3 +269,38 @@ class ConfigurationTests(TestCase):
         self.assertEqual(settings['SPAM'], 'eggs')
         self.assertEqual(settings['PROPERTY'], 1)
         self.assertEqual(settings['METHOD'], 2)
+
+
+class PydanticNamespaceRuleTests(TestCase):
+    """
+    Pins what pydantic accepts in a model namespace without an annotation.
+
+    A configuration marks everything else as a class variable. If pydantic
+    changes its mind, these fail here rather than crashing a settings module
+    that happens to hold one of these values.
+    """
+
+    def test_pydantic_rejects_a_plain_unannotated_value(self):
+        with self.assertRaises(PydanticUserError):
+            class Model(BaseModel):
+                SETTING = 'spam'
+
+    def test_pydantic_rejects_an_unannotated_class(self):
+        with self.assertRaises(PydanticUserError):
+            class Model(BaseModel):
+                SETTING = dict
+
+    def test_pydantic_accepts_what_we_leave_unannotated(self):
+        class Model(BaseModel):
+            LAMBDA = lambda self: 1  # noqa: E731
+            STATIC = staticmethod(lambda: 2)
+            KLASS = classmethod(lambda cls: 3)
+
+            @property
+            def PROP(self):
+                return 4
+
+        self.assertEqual(dict(Model.model_fields), {})
+        for value in (Model.__dict__['LAMBDA'], Model.__dict__['STATIC'],
+                      Model.__dict__['KLASS'], Model.__dict__['PROP']):
+            self.assertIsInstance(value, PYDANTIC_IGNORES)
